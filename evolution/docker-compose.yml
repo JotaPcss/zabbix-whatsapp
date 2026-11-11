@@ -1,0 +1,41 @@
+# Evolution API v2 + PostgreSQL + Redis
+# Uso:  cp .env.example .env  (edite a APIKEY)  &&  docker compose up -d
+# Confira a tag mais recente estável em https://github.com/EvolutionAPI/evolution-api/releases
+
+services:
+  evolution:
+    image: atendai/evolution-api:v2.2.3
+    container_name: evolution_api
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:8080"   # exponha só localmente; publique via proxy reverso com HTTPS se o Zabbix estiver em outra máquina
+    env_file: .env
+    volumes:
+      - evolution_instances:/evolution/instances
+    depends_on:
+      - postgres
+      - redis
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: evolution_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: evolution
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: evolution
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    container_name: evolution_redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+
+volumes:
+  evolution_instances:
+  postgres_data:
+  redis_data:

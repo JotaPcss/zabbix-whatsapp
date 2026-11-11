@@ -1,0 +1,9 @@
+# Configurações reais com tokens/senhas: nunca versionar
+config.yaml
+.env
+
+# Saídas e cache
+relatorios/
+__pycache__/
+*.pyc
+venv/

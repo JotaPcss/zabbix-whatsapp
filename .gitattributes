@@ -1,0 +1,3 @@
+# Scripts rodam em Linux: manter LF sempre
+* text=auto eol=lf
+*.pdf binary

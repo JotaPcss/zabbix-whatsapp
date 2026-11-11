@@ -1,0 +1,46 @@
+# Copie para config.yaml e ajuste. Proteja o arquivo: chmod 600 config.yaml (contém tokens).
+
+company_name: "Sua Empresa Suporte Linux"   # aparece no rodapé do PDF
+output_dir: /var/lib/zabbix-whatsapp/relatorios
+
+evolution:
+  url: http://127.0.0.1:8080
+  instance: zabbix
+  apikey: "COLOQUE_A_APIKEY_DA_EVOLUTION"
+  verify_ssl: true
+
+# Valores padrão herdados por todos os clientes (cada cliente pode sobrescrever).
+defaults:
+  timezone: America/Sao_Paulo
+  min_severity: 2            # 0=Não class. 1=Info 2=Atenção 3=Média 4=Alta 5=Desastre
+  availability_severity: 4   # problemas >= esta severidade contam como indisponibilidade
+  reports: [weekly, monthly] # quais relatórios este cliente recebe
+  attach_pdf: true
+  verify_ssl: true
+
+clients:
+  # Cliente com Zabbix próprio, autenticando por API token (recomendado).
+  # Crie em: Usuários > API tokens. O usuário precisa de permissão de leitura nos grupos.
+  - name: "Acme Ltda"
+    zabbix_url: https://zabbix.acme.com.br
+    zabbix_token: "TOKEN_API_DO_ZABBIX"
+    send_to:
+      - "120363025555555555@g.us"   # grupo do cliente (descubra com --list-groups)
+      - "5511999998888"             # número do gerente de conta
+    reports: [daily, weekly, monthly]
+
+  # Vários clientes no MESMO Zabbix (o de vocês), separados por grupo de hosts.
+  - name: "Beta Transportes"
+    zabbix_url: https://zabbix.suaempresa.com.br
+    zabbix_token: "TOKEN_API_DO_ZABBIX_CENTRAL"
+    host_groups: ["Clientes/Beta Transportes"]
+    send_to: ["120363036666666666@g.us"]
+
+  # Zabbix 6.0 antigo sem token: usuário e senha (evite se puder).
+  - name: "Gama Saúde"
+    zabbix_url: https://monitor.gamasaude.com.br/zabbix
+    zabbix_user: relatorios
+    zabbix_password: "SENHA"
+    verify_ssl: false          # certificado autoassinado
+    min_severity: 3
+    send_to: ["5521988887777"]
