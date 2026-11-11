@@ -1,33 +1,37 @@
 #!/usr/bin/env python3
 """
-Relatórios periódicos do Zabbix enviados por WhatsApp (Evolution API v2).
+Relatórios periódicos do Zabbix enviados por WhatsApp através do Hermes Agent.
 
 Para cada cliente do arquivo de configuração:
   1. consulta a API do Zabbix (6.0+) do período (diário, semanal, mensal ou datas livres);
   2. monta um resumo em texto + um PDF com problemas, disponibilidade e top hosts/triggers;
-  3. envia texto e PDF para os destinos (números ou grupos) via Evolution API.
+  3. envia texto e PDF para os destinos (números ou grupos) com "hermes send".
+     Nenhuma IA é usada aqui: o Hermes só faz a entrega no WhatsApp.
 
 Exemplos:
   ./zabbix_whatsapp_report.py -c config.yaml --period weekly
   ./zabbix_whatsapp_report.py -c config.yaml --period monthly --client "Acme Ltda" --dry-run
   ./zabbix_whatsapp_report.py -c config.yaml --start 2026-10-01 --end 2026-10-15
-  ./zabbix_whatsapp_report.py -c config.yaml --list-groups
+  ./zabbix_whatsapp_report.py -c config.yaml --list-targets
   ./zabbix_whatsapp_report.py --demo --dry-run          # PDF de exemplo, sem Zabbix
 """
 
 from __future__ import annotations
 
 import argparse
-import base64
 import datetime as dt
 import logging
+import os
 import random
 import re
+import shlex
+import shutil
+import subprocess
 import sys
+import tempfile
 import unicodedata
 from collections import Counter, defaultdict
 from pathlib import Path
-from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 import requests
@@ -108,48 +112,72 @@ class ZabbixAPI:
                 pass
 
 
-# --------------------------------------------------------------------------- Evolution API
+# --------------------------------------------------------------------------- Hermes Agent
 
-def normalize_destination(dest: str) -> str:
-    dest = dest.strip()
-    return dest if "@" in dest else re.sub(r"\D", "", dest)
+def to_chat_id(dest: str, dm_suffix: str = "@s.whatsapp.net") -> str:
+    """Grupo (120363...@g.us) fica igual; número (+55 11 99999-8888) vira 5511999998888@s.whatsapp.net."""
+    dest = str(dest).strip()
+    if "@" in dest:
+        return dest
+    digits = re.sub(r"\D", "", dest)
+    return digits + dm_suffix if digits else ""
 
 
-class Evolution:
-    def __init__(self, url: str, instance: str, apikey: str, verify_ssl: bool = True, timeout: int = 120):
-        self.base = url.rstrip("/")
-        self.instance = quote(instance, safe="")
-        self.session = requests.Session()
-        self.session.verify = verify_ssl
-        self.session.headers.update({"apikey": apikey, "Content-Type": "application/json"})
+class Hermes:
+    """Entrega mensagens no WhatsApp pelo CLI "hermes send" (sem IA, sem passar pelo agente).
+
+    O processo precisa rodar com o mesmo usuário (ou HERMES_HOME) do gateway do Hermes, e o
+    gateway precisa estar ativo, porque é ele que mantém a sessão do WhatsApp.
+    """
+
+    def __init__(self, command="hermes", home: str | None = None, timeout: int = 180,
+                 dm_suffix: str = "@s.whatsapp.net"):
+        self.cmd = shlex.split(command) if isinstance(command, str) else [str(c) for c in command]
+        self.env = os.environ.copy()
+        if home:
+            self.env["HERMES_HOME"] = os.path.expanduser(home)
         self.timeout = timeout
+        self.dm_suffix = dm_suffix
 
-    def _post(self, path: str, body: dict):
-        resp = self.session.post(f"{self.base}{path}/{self.instance}", json=body, timeout=self.timeout)
-        if resp.status_code >= 300:
-            raise RuntimeError(f"Evolution {path} HTTP {resp.status_code}: {resp.text[:500]}")
-        return resp.json() if resp.content else {}
+    def _run(self, args: list[str], stdin: str | None = None) -> str:
+        try:
+            proc = subprocess.run(self.cmd + args, input=stdin, capture_output=True, text=True,
+                                  encoding="utf-8", timeout=self.timeout, env=self.env)
+        except FileNotFoundError:
+            raise RuntimeError(f"comando do Hermes não encontrado: {self.cmd[0]!r} (ajuste hermes.command no config)")
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(f"hermes {' '.join(args[:3])} não respondeu em {self.timeout}s")
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout).strip()[-500:]
+            kind = "uso incorreto" if proc.returncode == 2 else "falha na entrega"
+            raise RuntimeError(f"hermes send: {kind} (código {proc.returncode}): {detail}")
+        return proc.stdout
 
-    def send_text(self, to: str, text: str):
-        return self._post("/message/sendText", {"number": to, "text": text, "linkPreview": False})
+    def target(self, dest: str) -> str:
+        chat_id = to_chat_id(dest, self.dm_suffix)
+        if not chat_id:
+            raise RuntimeError(f"destino inválido: {dest!r}")
+        return f"whatsapp:{chat_id}"
 
-    def send_document(self, to: str, file_path: Path, caption: str = ""):
-        media = base64.b64encode(file_path.read_bytes()).decode("ascii")
-        return self._post("/message/sendMedia", {
-            "number": to,
-            "mediatype": "document",
-            "mimetype": "application/pdf",
-            "caption": caption,
-            "media": media,
-            "fileName": file_path.name,
-        })
+    def send_text(self, dest: str, text: str) -> None:
+        # Texto pelo stdin: evita problemas de aspas e de tamanho de linha de comando.
+        self._run(["send", "--to", self.target(dest), "--quiet"], stdin=text)
 
-    def list_groups(self):
-        resp = self.session.get(f"{self.base}/group/fetchAllGroups/{self.instance}",
-                                params={"getParticipants": "false"}, timeout=self.timeout)
-        if resp.status_code >= 300:
-            raise RuntimeError(f"Evolution fetchAllGroups HTTP {resp.status_code}: {resp.text[:500]}")
-        return resp.json()
+    def send_document(self, dest: str, file_path: Path, caption: str = "") -> None:
+        # MEDIA:<caminho> anexa o arquivo; [[as_document]] força envio como documento (não como foto).
+        # O caminho termina no primeiro espaço: se houver espaço, envia uma cópia de um local sem espaços.
+        path = file_path.resolve()
+        if re.search(r"\s", str(path)):
+            safe_dir = Path(tempfile.gettempdir()) / "zabbix-whatsapp"
+            safe_dir.mkdir(parents=True, exist_ok=True)
+            safe = safe_dir / re.sub(r"\s+", "_", path.name)
+            shutil.copyfile(path, safe)
+            path = safe
+        message = f"{caption}\nMEDIA:{path} [[as_document]]".strip()
+        self._run(["send", "--to", self.target(dest), "--quiet", message])
+
+    def list_targets(self) -> str:
+        return self._run(["send", "--list", "whatsapp"])
 
 
 # --------------------------------------------------------------------------- Período
@@ -612,18 +640,33 @@ def load_config(path: str) -> dict:
     return cfg
 
 
-def run_client(client: dict, cfg: dict, args, period: str, evo: Evolution | None) -> None:
-    defaults = cfg.get("defaults", {})
-    client = {**defaults, **client}
+def find_client(cfg: dict, name: str) -> dict:
+    """Busca um cliente pelo nome (sem diferenciar maiúsculas/acentos) já com os defaults aplicados."""
+    wanted = slug(name)
+    for c in cfg.get("clients", []):
+        if slug(c["name"]) == wanted:
+            return {**cfg.get("defaults", {}), **c}
+    names = ", ".join(c["name"] for c in cfg.get("clients", []))
+    raise SystemExit(f"Cliente {name!r} não existe no config. Clientes: {names}")
+
+
+def open_zabbix(client: dict) -> ZabbixAPI:
+    return ZabbixAPI(client["zabbix_url"], token=client.get("zabbix_token"), user=client.get("zabbix_user"),
+                     password=client.get("zabbix_password"), verify_ssl=client.get("verify_ssl", True))
+
+
+def generate(client: dict, cfg: dict, period: str, start_s: str | None = None, end_s: str | None = None,
+             output_dir: str | None = None, demo: bool = False) -> tuple[str, Path]:
+    """Coleta, calcula e gera o PDF. Retorna (texto do WhatsApp, caminho do PDF). Não envia nada."""
+    client = {**cfg.get("defaults", {}), **client}
     tz = ZoneInfo(client.get("timezone", "America/Sao_Paulo"))
-    start, end = period_window(period, tz, args.start, args.end)
+    start, end = period_window(period, tz, start_s, end_s)
     log.info("[%s] período %s → %s", client["name"], start.isoformat(), end.isoformat())
 
-    if args.demo:
+    if demo:
         data = demo_data(start, end)
     else:
-        api = ZabbixAPI(client["zabbix_url"], token=client.get("zabbix_token"), user=client.get("zabbix_user"),
-                        password=client.get("zabbix_password"), verify_ssl=client.get("verify_ssl", True))
+        api = open_zabbix(client)
         try:
             log.info("[%s] Zabbix %s", client["name"], api.version_str)
             data = collect(api, client, start, end)
@@ -633,31 +676,43 @@ def run_client(client: dict, cfg: dict, args, period: str, evo: Evolution | None
     metrics = analyze(data, tz)
     text = build_text(client, period, start, end, metrics)
 
-    out_dir = Path(args.output_dir or cfg.get("output_dir", "./relatorios"))
+    out_dir = Path(output_dir or cfg.get("output_dir", "./relatorios")).expanduser()
     out_dir.mkdir(parents=True, exist_ok=True)
-    pdf_path = out_dir / f"relatorio-{slug(client['name'])}-{period}-{start:%Y%m%d}.pdf"
+    pdf_path = (out_dir / f"relatorio-{slug(client['name'])}-{period}-{start:%Y%m%d}.pdf").resolve()
     company = cfg.get("company_name", "Suporte Linux")
     build_pdf(pdf_path, client, period, start, end, metrics, tz, company)
     log.info("[%s] PDF gerado: %s", client["name"], pdf_path)
+    return text, pdf_path
 
-    if args.dry_run or evo is None:
+
+def make_hermes(cfg: dict) -> Hermes:
+    h = cfg.get("hermes") or {}
+    return Hermes(command=h.get("command", "hermes"), home=h.get("home"),
+                  timeout=int(h.get("timeout", 180)), dm_suffix=h.get("dm_suffix", "@s.whatsapp.net"))
+
+
+def run_client(client: dict, cfg: dict, args, period: str, hermes: Hermes | None) -> None:
+    text, pdf_path = generate(client, cfg, period, args.start, args.end, args.output_dir, args.demo)
+
+    if args.dry_run or hermes is None:
         print(f"\n===== {client['name']} (dry-run, nada enviado) =====\n{text}\nPDF: {pdf_path}\n")
         return
 
+    client = {**cfg.get("defaults", {}), **client}
     send_to = client.get("send_to") or []
     if isinstance(send_to, str):
         send_to = [send_to]
     if not send_to:
         raise RuntimeError("cliente sem 'send_to'")
-    for dest in map(normalize_destination, send_to):
-        evo.send_text(dest, text)
+    for dest in send_to:
+        hermes.send_text(dest, text)
         if client.get("attach_pdf", True):
-            evo.send_document(dest, pdf_path, caption=pdf_path.name)
-        log.info("[%s] enviado para %s", client["name"], dest)
+            hermes.send_document(dest, pdf_path, caption=pdf_path.name)
+        log.info("[%s] enviado para %s", client["name"], hermes.target(dest))
 
 
 def main(argv=None) -> int:
-    p = argparse.ArgumentParser(description="Relatórios do Zabbix por WhatsApp (Evolution API)")
+    p = argparse.ArgumentParser(description="Relatórios do Zabbix por WhatsApp (Hermes Agent)")
     p.add_argument("-c", "--config", default="config.yaml")
     p.add_argument("--period", choices=["daily", "weekly", "monthly"], default=None)
     p.add_argument("--start", help="Data inicial YYYY-MM-DD (período personalizado)")
@@ -666,7 +721,8 @@ def main(argv=None) -> int:
     p.add_argument("--dry-run", action="store_true", help="Gera texto e PDF mas não envia")
     p.add_argument("--demo", action="store_true", help="Usa dados fictícios em vez do Zabbix")
     p.add_argument("--output-dir")
-    p.add_argument("--list-groups", action="store_true", help="Lista grupos do WhatsApp e seus JIDs")
+    p.add_argument("--list-targets", "--list-groups", dest="list_targets", action="store_true",
+                   help="Lista os destinos de WhatsApp que o Hermes conhece (grupos e contatos)")
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args(argv)
 
@@ -686,18 +742,12 @@ def main(argv=None) -> int:
     else:
         cfg = load_config(args.config)
 
-    evo = None
-    if not args.dry_run:
-        e = cfg.get("evolution") or {}
-        if not all(e.get(k) for k in ("url", "instance", "apikey")):
-            raise SystemExit("Config 'evolution' precisa de url, instance e apikey.")
-        evo = Evolution(e["url"], e["instance"], e["apikey"], verify_ssl=e.get("verify_ssl", True))
+    hermes = None if args.dry_run else make_hermes(cfg)
 
-    if args.list_groups:
-        if evo is None:
-            raise SystemExit("--list-groups precisa da seção 'evolution' (e sem --dry-run).")
-        for g in sorted(evo.list_groups(), key=lambda g: g.get("subject", "")):
-            print(f"{g.get('id')}\t{g.get('subject')}")
+    if args.list_targets:
+        if hermes is None:
+            raise SystemExit("--list-targets não funciona com --dry-run/--demo.")
+        print(hermes.list_targets())
         return 0
 
     clients = cfg["clients"]
@@ -713,7 +763,7 @@ def main(argv=None) -> int:
     failures = 0
     for client in clients:
         try:
-            run_client(client, cfg, args, period, evo)
+            run_client(client, cfg, args, period, hermes)
         except Exception as exc:  # noqa: BLE001 - um cliente com erro não pode parar os outros
             failures += 1
             log.error("[%s] falhou: %s", client.get("name"), exc, exc_info=args.verbose)

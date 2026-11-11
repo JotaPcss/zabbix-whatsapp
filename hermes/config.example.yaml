@@ -1,0 +1,21 @@
+# Trecho para MESCLAR no ~/.hermes/config.yaml (não substitua o arquivo inteiro).
+# Se já existir uma seção "platforms:", acrescente só o bloco "webhook:" dentro dela.
+
+platforms:
+  webhook:
+    enabled: true
+    extra:
+      port: 8644
+      # Tempestade de alertas: o padrão do Hermes é 30 por minuto por rota.
+      rate_limit: 120
+      routes:
+        zabbix-alert:
+          # Gere com: openssl rand -hex 32   e coloque o MESMO valor em hermes_secret no Zabbix.
+          secret: "TROQUE_POR_UM_SEGREDO_FORTE"
+          # deliver_only: o texto vai direto para o WhatsApp, sem passar pela IA (sem custo, sem atraso).
+          deliver: whatsapp
+          deliver_only: true
+          prompt: "{text}"
+          deliver_extra:
+            # O tipo de mídia do Zabbix informa o destino (grupo ou número) em cada alerta.
+            chat_id: "{chat_id}"

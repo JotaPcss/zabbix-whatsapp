@@ -2,7 +2,7 @@ zabbix_export:
   version: '6.0'
   date: '2026-11-11T00:00:00Z'
   media_types:
-    - name: 'WhatsApp (Evolution API)'
+    - name: 'WhatsApp (Hermes Agent)'
       type: WEBHOOK
       parameters:
         - name: alert_message
@@ -11,6 +11,8 @@ zabbix_export:
           value: '{ALERT.SUBJECT}'
         - name: client_name
           value: '{EVENT.TAGS.cliente}'
+        - name: dm_suffix
+          value: '@s.whatsapp.net'
         - name: event_date
           value: '{EVENT.DATE}'
         - name: event_duration
@@ -33,20 +35,24 @@ zabbix_export:
           value: '{EVENT.TIME}'
         - name: event_update_action
           value: '{EVENT.UPDATE.ACTION}'
+        - name: event_update_date
+          value: '{EVENT.UPDATE.DATE}'
         - name: event_update_message
           value: '{EVENT.UPDATE.MESSAGE}'
         - name: event_update_status
           value: '{EVENT.UPDATE.STATUS}'
+        - name: event_update_time
+          value: '{EVENT.UPDATE.TIME}'
         - name: event_update_user
           value: '{USER.FULLNAME}'
         - name: event_value
           value: '{EVENT.VALUE}'
-        - name: evolution_apikey
-          value: '<COLOQUE_A_APIKEY>'
-        - name: evolution_instance
-          value: 'zabbix'
-        - name: evolution_url
-          value: 'http://evolution.suaempresa.com.br:8080'
+        - name: hermes_route
+          value: 'zabbix-alert'
+        - name: hermes_secret
+          value: '<SEGREDO_DA_ROTA>'
+        - name: hermes_url
+          value: 'https://hermes.suaempresa.com.br'
         - name: host_ip
           value: '{HOST.IP}'
         - name: host_name
@@ -62,11 +68,14 @@ zabbix_export:
         - name: zabbix_url
           value: 'https://zabbix.suaempresa.com.br'
       script: |
-        // Zabbix webhook: alertas via WhatsApp usando Evolution API (v2)
+        // Zabbix webhook: alertas via WhatsApp usando o Hermes Agent (Nous Research).
         // Compatível com Zabbix 6.0+ (motor JavaScript Duktape, ES5 — sem let/const/arrow).
         //
-        // Este é o mesmo script embutido em whatsapp_evolution_mediatype.yaml.
-        // Mantido separado para facilitar leitura, versionamento e testes.
+        // O script monta a mensagem e faz um POST assinado (HMAC-SHA256, esquema "V2" do Hermes)
+        // para uma rota de webhook do Hermes configurada com deliver_only: true. Nesse modo o Hermes
+        // entrega o texto direto no WhatsApp, sem chamar a IA: instantâneo e sem custo de LLM.
+        //
+        // Este é o mesmo script embutido em whatsapp_hermes_mediatype.yaml (gerado por build_mediatype.js).
 
         var SEVERITY = {
             '0': { name: 'Não classificada', icon: '⚪' },
@@ -93,13 +102,16 @@ zabbix_export:
             return /^(1|true|yes|sim)$/i.test(clean(value));
         }
 
-        // Aceita número (5511999998888, +55 (11) 99999-8888) ou JID de grupo (120363...@g.us).
-        function normalizeDestination(dest) {
+        // Converte o destino em JID do WhatsApp, que é o chat_id usado pelo Hermes:
+        //   grupo:  120363025555555555@g.us        (mantido como está)
+        //   número: +55 (11) 99999-8888  ->  5511999998888@s.whatsapp.net
+        function toChatId(dest, dmSuffix) {
             dest = dest.trim();
             if (dest.indexOf('@') !== -1) {
                 return dest;
             }
-            return dest.replace(/\D/g, '');
+            var digits = dest.replace(/\D/g, '');
+            return digits ? digits + dmSuffix : '';
         }
 
         function line(label, value) {
@@ -169,45 +181,84 @@ zabbix_export:
             return header + '\n\n' + details.replace(/\n$/, '') + eventLink(p);
         }
 
-        function sendText(p, destination, text) {
-            var url = clean(p.evolution_url).replace(/\/+$/, '') +
-                '/message/sendText/' + encodeURIComponent(clean(p.evolution_instance));
+        // Identificador estável por (evento, tipo de notificação, destino). O Hermes guarda esse ID por
+        // 1 hora e descarta repetições: se o Zabbix tentar de novo um envio que na verdade chegou,
+        // o WhatsApp não recebe a mensagem duplicada.
+        function requestId(p, chatId) {
+            var parts = [
+                clean(p.event_id) || 'test',
+                clean(p.event_value),
+                clean(p.event_update_status),
+                clean(p.event_update_date) + clean(p.event_update_time),
+                chatId
+            ];
+            return 'zbx-' + sha256(parts.join('|')).substring(0, 32);
+        }
+
+        function deliver(p, chatId, text) {
+            var url = clean(p.hermes_url).replace(/\/+$/, '') +
+                '/webhooks/' + encodeURIComponent(clean(p.hermes_route));
+
+            var body = JSON.stringify({
+                chat_id: chatId,
+                text: text,
+                event_id: clean(p.event_id),
+                severity: clean(p.event_nseverity),
+                host: clean(p.host_name),
+                client: clean(p.client_name)
+            });
+
+            // Esquema V2 do Hermes: HMAC-SHA256 em hex de "<timestamp>.<corpo>", com o timestamp em
+            // segundos. O relógio do servidor Zabbix precisa estar sincronizado (±300 s do Hermes).
+            var timestamp = String(Math.floor(Date.now() / 1000));
+            var signature = hmac('sha256', clean(p.hermes_secret), timestamp + '.' + body);
 
             var req = new HttpRequest();
             req.addHeader('Content-Type: application/json');
-            req.addHeader('apikey: ' + clean(p.evolution_apikey));
+            req.addHeader('X-Webhook-Timestamp: ' + timestamp);
+            req.addHeader('X-Webhook-Signature-V2: ' + signature);
+            req.addHeader('X-Request-ID: ' + requestId(p, chatId));
             if (clean(p.http_proxy)) {
                 req.setProxy(clean(p.http_proxy));
             }
 
-            var payload = JSON.stringify({ number: destination, text: text, linkPreview: false });
-            Zabbix.log(4, '[WhatsApp Evolution] POST ' + url + ' para ' + destination);
-
-            var response = req.post(url, payload);
+            Zabbix.log(4, '[WhatsApp Hermes] POST ' + url + ' para ' + chatId);
+            var response = req.post(url, body);
             var status = req.getStatus();
 
             if (status < 200 || status >= 300) {
-                var detail = response;
-                try {
-                    var parsed = JSON.parse(response);
-                    detail = JSON.stringify(parsed.response || parsed.message || parsed);
-                } catch (e) { /* resposta não-JSON */ }
-                throw 'HTTP ' + status + ' ao enviar para ' + destination + ': ' + detail;
+                var hint = {
+                    401: 'assinatura recusada: confira hermes_secret e o relógio (NTP) do servidor Zabbix',
+                    404: 'rota inexistente: confira hermes_route e o config.yaml do Hermes',
+                    413: 'mensagem grande demais',
+                    429: 'limite de envios por minuto da rota atingido (aumente rate_limit no Hermes)',
+                    502: 'o Hermes não conseguiu entregar no WhatsApp: confira o gateway e o chat_id'
+                }[status] || '';
+                throw 'HTTP ' + status + ' para ' + chatId + (hint ? ' (' + hint + ')' : '') + ': ' +
+                    String(response).substring(0, 300);
             }
+
+            var result = {};
+            try {
+                result = JSON.parse(response);
+            } catch (e) { /* resposta não-JSON */ }
+            Zabbix.log(4, '[WhatsApp Hermes] ' + chatId + ': ' + (result.status || 'ok'));
         }
 
         try {
             var params = JSON.parse(value);
 
-            ['evolution_url', 'evolution_instance', 'evolution_apikey'].forEach(function (key) {
+            ['hermes_url', 'hermes_route', 'hermes_secret'].forEach(function (key) {
                 if (!clean(params[key])) {
                     throw 'Parâmetro obrigatório "' + key + '" não configurado no tipo de mídia.';
                 }
             });
 
+            var dmSuffix = clean(params.dm_suffix) || '@s.whatsapp.net';
+
             // Separa só por vírgula, ponto e vírgula ou quebra de linha: "+55 (11) 99999-8888" é UM destino.
             var destinations = clean(params.send_to).split(/[,;\n]+/)
-                .map(normalizeDestination)
+                .map(function (d) { return toChatId(d, dmSuffix); })
                 .filter(function (d) { return d.length > 0; });
 
             if (destinations.length === 0) {
@@ -217,9 +268,9 @@ zabbix_export:
             var text = buildMessage(params);
             var errors = [];
 
-            destinations.forEach(function (dest) {
+            destinations.forEach(function (chatId) {
                 try {
-                    sendText(params, dest, text);
+                    deliver(params, chatId, text);
                 } catch (e) {
                     errors.push(String(e));
                 }
@@ -231,11 +282,11 @@ zabbix_export:
 
             return 'OK';
         } catch (error) {
-            Zabbix.log(3, '[WhatsApp Evolution] Falha: ' + error);
+            Zabbix.log(3, '[WhatsApp Hermes] Falha: ' + error);
             throw 'Falha no envio WhatsApp: ' + error;
         }
       timeout: 30s
-      description: 'Envia alertas do Zabbix para WhatsApp (números ou grupos) via Evolution API v2. Em "Enviar para" use o número com DDI+DDD (5511999998888) ou o JID do grupo (120363...@g.us). Vários destinos separados por vírgula.'
+      description: 'Envia alertas do Zabbix para WhatsApp (números ou grupos) via webhook do Hermes Agent (rota deliver_only). Assinado com HMAC-SHA256: o relógio do servidor Zabbix precisa estar sincronizado. Em "Enviar para" use o número com DDI+DDD (5511999998888) ou o JID do grupo (120363...@g.us). Vários destinos separados por vírgula.'
       message_templates:
         - event_source: TRIGGERS
           operation_mode: PROBLEM

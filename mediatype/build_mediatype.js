@@ -1,11 +1,11 @@
-// Gera whatsapp_evolution_mediatype.yaml a partir de whatsapp_evolution.js.
+// Gera whatsapp_hermes_mediatype.yaml a partir de whatsapp_hermes.js.
 // Uso: node build_mediatype.js
 // Rode sempre que alterar o script, para manter o YAML de importação sincronizado.
 
 var fs = require('fs');
 var path = require('path');
 
-var script = fs.readFileSync(path.join(__dirname, 'whatsapp_evolution.js'), 'utf8')
+var script = fs.readFileSync(path.join(__dirname, 'whatsapp_hermes.js'), 'utf8')
     .replace(/\r\n/g, '\n')
     .replace(/\s+$/, '');
 
@@ -13,6 +13,7 @@ var params = [
     ['alert_message', '{ALERT.MESSAGE}'],
     ['alert_subject', '{ALERT.SUBJECT}'],
     ['client_name', '{EVENT.TAGS.cliente}'],
+    ['dm_suffix', '@s.whatsapp.net'],
     ['event_date', '{EVENT.DATE}'],
     ['event_duration', '{EVENT.DURATION}'],
     ['event_id', '{EVENT.ID}'],
@@ -24,13 +25,15 @@ var params = [
     ['event_source', '{EVENT.SOURCE}'],
     ['event_time', '{EVENT.TIME}'],
     ['event_update_action', '{EVENT.UPDATE.ACTION}'],
+    ['event_update_date', '{EVENT.UPDATE.DATE}'],
     ['event_update_message', '{EVENT.UPDATE.MESSAGE}'],
     ['event_update_status', '{EVENT.UPDATE.STATUS}'],
+    ['event_update_time', '{EVENT.UPDATE.TIME}'],
     ['event_update_user', '{USER.FULLNAME}'],
     ['event_value', '{EVENT.VALUE}'],
-    ['evolution_apikey', '<COLOQUE_A_APIKEY>'],
-    ['evolution_instance', 'zabbix'],
-    ['evolution_url', 'http://evolution.suaempresa.com.br:8080'],
+    ['hermes_route', 'zabbix-alert'],
+    ['hermes_secret', '<SEGREDO_DA_ROTA>'],
+    ['hermes_url', 'https://hermes.suaempresa.com.br'],
     ['host_ip', '{HOST.IP}'],
     ['host_name', '{HOST.NAME}'],
     ['http_proxy', ''],
@@ -69,7 +72,7 @@ out.push('zabbix_export:');
 out.push("  version: '6.0'");
 out.push("  date: '2026-11-11T00:00:00Z'");
 out.push('  media_types:');
-out.push("    - name: 'WhatsApp (Evolution API)'");
+out.push("    - name: 'WhatsApp (Hermes Agent)'");
 out.push('      type: WEBHOOK');
 out.push('      parameters:');
 params.forEach(function (p) {
@@ -79,7 +82,7 @@ params.forEach(function (p) {
 out.push('      script: |');
 out.push(block(script, 8));
 out.push('      timeout: 30s');
-out.push("      description: 'Envia alertas do Zabbix para WhatsApp (números ou grupos) via Evolution API v2. Em \"Enviar para\" use o número com DDI+DDD (5511999998888) ou o JID do grupo (120363...@g.us). Vários destinos separados por vírgula.'");
+out.push("      description: 'Envia alertas do Zabbix para WhatsApp (números ou grupos) via webhook do Hermes Agent (rota deliver_only). Assinado com HMAC-SHA256: o relógio do servidor Zabbix precisa estar sincronizado. Em \"Enviar para\" use o número com DDI+DDD (5511999998888) ou o JID do grupo (120363...@g.us). Vários destinos separados por vírgula.'");
 out.push('      message_templates:');
 templates.forEach(function (t) {
     out.push('        - event_source: ' + t[0]);
@@ -91,5 +94,5 @@ templates.forEach(function (t) {
     out.push(block(t[3], 12));
 });
 
-fs.writeFileSync(path.join(__dirname, 'whatsapp_evolution_mediatype.yaml'), out.join('\n') + '\n', 'utf8');
-console.log('whatsapp_evolution_mediatype.yaml gerado.');
+fs.writeFileSync(path.join(__dirname, 'whatsapp_hermes_mediatype.yaml'), out.join('\n') + '\n', 'utf8');
+console.log('whatsapp_hermes_mediatype.yaml gerado.');

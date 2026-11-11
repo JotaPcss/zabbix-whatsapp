@@ -1,0 +1,86 @@
+zabbix_export:
+  version: '6.0'
+  date: '2026-11-11T00:00:00Z'
+  groups:
+    - uuid: a571c0d144b14fd4a87a9d9b2aa9fcd6
+      name: Templates/Applications
+  templates:
+    - uuid: 80c3acc388e544eab17c649d1d6203a3
+      template: 'Hermes Agent WhatsApp gateway'
+      name: 'Hermes Agent WhatsApp gateway'
+      description: |
+        Vigia o Hermes Agent que entrega os alertas e relatórios do Zabbix no WhatsApp.
+        Vincule ao host onde o Hermes roda (precisa do Zabbix agent nesse host).
+        Envie os alertas DESTE template por e-mail/Telegram/SMS: se o WhatsApp caiu, ele não consegue avisar de si mesmo.
+      groups:
+        - name: Templates/Applications
+      items:
+        - uuid: 0fa6d78f863b48f59a60467a66fd927f
+          name: 'Hermes: webhook (status)'
+          type: HTTP_AGENT
+          key: hermes.webhook.status
+          delay: 1m
+          history: 7d
+          trends: '0'
+          value_type: CHAR
+          description: 'GET /health da plataforma de webhook do Hermes. Esperado: ok.'
+          url: '{$HERMES.WEBHOOK.URL}/health'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.status
+          triggers:
+            - uuid: f37ca18b2dd74db5889aa1022b3d76f2
+              expression: 'last(/Hermes Agent WhatsApp gateway/hermes.webhook.status)<>"ok"'
+              name: 'Hermes: webhook com status {ITEM.LASTVALUE1}'
+              priority: HIGH
+              description: 'Os alertas do Zabbix não estão sendo aceitos pelo Hermes.'
+            - uuid: 5f4139c357d342be9568e1557afdc095
+              expression: 'nodata(/Hermes Agent WhatsApp gateway/hermes.webhook.status,5m)=1'
+              name: 'Hermes: webhook sem resposta há 5 minutos'
+              priority: HIGH
+              description: 'Gateway do Hermes parado, porta 8644 bloqueada ou URL errada em {$HERMES.WEBHOOK.URL}. Verifique: hermes gateway status'
+        - uuid: 68c67a005a6343ee93f6f533525a24c5
+          name: 'Hermes: ponte do WhatsApp (porta)'
+          key: 'net.tcp.service[tcp,{$HERMES.BRIDGE.HOST},{$HERMES.BRIDGE.PORT}]'
+          delay: 1m
+          history: 7d
+          description: '1 = a ponte Baileys do WhatsApp está escutando. Não garante que a sessão do WhatsApp esteja conectada.'
+          valuemap:
+            name: 'Service state'
+          triggers:
+            - uuid: ebfe1ee64bb24f94a0976768977c5e93
+              expression: 'max(/Hermes Agent WhatsApp gateway/net.tcp.service[tcp,{$HERMES.BRIDGE.HOST},{$HERMES.BRIDGE.PORT}],3m)=0'
+              name: 'Hermes: ponte do WhatsApp parada'
+              priority: HIGH
+              description: 'Alertas e relatórios não chegam ao WhatsApp. Verifique: hermes gateway status e o bridge.log; se a sessão caiu, pareie de novo com: hermes whatsapp'
+        - uuid: 3a63d4916be74c0088262f9fc9e5279f
+          name: 'Hermes: ponte do WhatsApp (health)'
+          key: 'web.page.get[{$HERMES.BRIDGE.HOST},/health,{$HERMES.BRIDGE.PORT}]'
+          delay: 5m
+          history: 7d
+          trends: '0'
+          value_type: TEXT
+          description: 'Resposta do /health da ponte, para consulta. Use o conteúdo para criar um gatilho de sessão desconectada conforme a versão do Hermes.'
+          preprocessing:
+            - type: REGEX
+              parameters:
+                - '(\{.*\})'
+                - \1
+              error_handler: CUSTOM_VALUE
+              error_handler_params: 'sem JSON na resposta'
+      macros:
+        - macro: '{$HERMES.BRIDGE.HOST}'
+          value: 127.0.0.1
+        - macro: '{$HERMES.BRIDGE.PORT}'
+          value: '3000'
+        - macro: '{$HERMES.WEBHOOK.URL}'
+          value: 'http://127.0.0.1:8644'
+      valuemaps:
+        - uuid: 5c38caacb59c462690c55420f1fcbfe0
+          name: 'Service state'
+          mappings:
+            - value: '0'
+              newvalue: Parado
+            - value: '1'
+              newvalue: Ativo
